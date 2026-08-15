@@ -1,0 +1,1477 @@
+// Package teldrive provides an interface to the TelDrive storage system.
+//
+// TelDrive is a self-hosted file storage solution that uses Telegram
+// channels as the underlying storage backend. Files are split into chunks,
+// optionally encrypted, and uploaded as messages in a designated Telegram
+// channel or group. The TelDrive API server indexes and manages the file
+// metadata, providing a file-system-like interface over Telegram's storage.
+//
+// Key features:
+//   - Chunked uploads with configurable chunk size (auto-aligned to 16 MiB)
+//   - BLAKE3 tree hashing for integrity verification across 16 MiB blocks
+//   - Optional client-side encryption via the TelDrive server
+//   - SSE-based real-time change notification
+//   - Server-side copy, move, and directory operations
+//   - Public link sharing with optional password protection
+package teldrive
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/rclone/rclone/backend/teldrive/api"
+	"github.com/rclone/rclone/backend/teldrive/tdhash"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/fshttp"
+	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/object"
+	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/rest"
+)
+
+const (
+	// timeFormat is the format used for timestamps in API requests
+	timeFormat = time.RFC3339
+
+	// maxChunkSize is the maximum upload chunk size (2000 MiB).
+	// This is 125 × 16 MiB blocks, constrained by Telegram's per-message
+	// upload limit.
+	maxChunkSize = 2000 * fs.Mebi
+
+	// defaultChunkSize is the default upload chunk size (512 MiB).
+	// This equals 32 × 16 MiB blocks, chosen for optimal BLAKE3 tree
+	// hashing performance with a good balance of concurrency and memory use.
+	defaultChunkSize = 512 * fs.Mebi
+
+	// minChunkSize is the minimum allowed upload chunk size (64 MiB).
+	// This equals 4 × 16 MiB blocks — smaller values would waste
+	// Telegram message capacity.
+	minChunkSize = 64 * fs.Mebi
+
+	// apiKeyHeaderName is the HTTP header used to pass the API key
+	apiKeyHeaderName = "X-Api-Key"
+)
+
+var telDriveHash hash.Type
+
+func init() {
+	fs.Register(&fs.RegInfo{
+		Name:        "teldrive",
+		Description: "Tel Drive",
+		NewFs:       NewFs,
+		Options: []fs.Option{{
+			Help: `API key for authentication with the TelDrive server.
+
+This is the API token used to authenticate requests. Obtain it from
+your TelDrive dashboard or server admin.
+`,
+			Name:      "api_key",
+			Sensitive: true,
+		}, {
+			Help: `URL of the TelDrive API server.
+
+The base URL for the TelDrive API endpoint (e.g. https://teldrive.example.com).
+This is required for all operations.
+`,
+			Name:      "api_host",
+			Sensitive: true,
+		}, {
+			Help: `Upload chunk size.
+
+Files larger than this will be uploaded in multiple chunks. The chunk size
+is automatically aligned to the nearest 16 MiB multiple (the BLAKE3 tree
+hash block size) for optimal hashing performance.
+
+Larger chunk sizes reduce the number of API calls but use more memory
+during uploads (one chunk is buffered per concurrent upload stream).
+Minimum: 64 MiB, Maximum: 2000 MiB.
+`,
+			Name:    "chunk_size",
+			Default: defaultChunkSize,
+		}, {
+			Name: "link_password",
+			Help: `Password to set on created public links.
+
+When set, all public links created via the link command will require
+this password to access. If not set, links will be publicly accessible.
+`,
+		}, {
+			Help: `Number of items to return per page when listing files.
+
+Controls the page size for directory listing API calls. Larger values
+reduce the number of API requests needed for directories with many files,
+but may increase response time and memory usage for each request.
+`,
+			Name:    "page_size",
+			Default: 500,
+		}, {
+			Name: "channel_id",
+			Help: `Telegram channel ID where files will be stored.
+
+The ID of the Telegram channel or group used as storage backend by
+TelDrive. This should be the numeric ID of the channel. If the ID is
+negative (e.g. -1001234567890), the -100 prefix will be automatically
+stripped as required by the TelDrive API.
+`,
+			Sensitive: true,
+		}, {
+			Name:    "upload_concurrency",
+			Default: 4,
+			Help: `Number of chunks to upload in parallel per file.
+
+Higher concurrency can speed up large file uploads at the cost of
+more memory usage and potential rate-limiting. Each concurrent upload
+buffers one chunk in memory.
+`,
+			Advanced: true,
+		}, {
+			Name:    "threaded_streams",
+			Default: false,
+			Help: `Use threaded message streams for uploads.
+
+When enabled, uploads will use Telegram's threaded message replies
+to organize file parts, which can improve performance in channels
+with many concurrent uploads.
+`,
+			Advanced: true,
+		}, {
+			Help: `Optional alternative URL for upload API calls.
+
+If set, upload chunk requests will be sent to this host instead of
+the main api_host. Useful for load-balancing or directing upload
+traffic to a different server or CDN endpoint.
+`,
+			Name:      "upload_host",
+			Sensitive: true,
+		}, {
+			Name:    "encrypt_files",
+			Default: false,
+			Help: `Enable native TelDrive encryption for stored files.
+
+When enabled, files will be encrypted at rest using TelDrive's
+built-in encryption before being sent to Telegram. The encryption
+keys are managed by the TelDrive server.
+`,
+		}, {
+			Name:    "hash_enabled",
+			Default: true,
+			Help: `Enable BLAKE3 tree hashing for file integrity verification.
+
+Files are split into 16 MiB blocks, each hashed with BLAKE3, then
+the block hashes are combined into a final tree hash. This allows
+rclone to verify upload integrity and detect modifications.
+
+Disable only if the server does not support this hash type.
+`,
+		}, {
+			Name:     config.ConfigEncoding,
+			Help:     config.ConfigEncodingHelp,
+			Advanced: true,
+			Default:  encoder.Standard | encoder.EncodeInvalidUtf8,
+		}},
+	})
+
+	telDriveHash = hash.RegisterHash("teldrive", "TelDriveHash", tdhash.Size, tdhash.New)
+}
+
+// Options defines the configuration for this backend.
+// These are set via the rclone config file, command-line flags, or
+// environment variables prefixed with RCLONE_TELDRIVE_.
+type Options struct {
+	ApiHost           string               `config:"api_host"`           // URL of the TelDrive API server
+	UploadHost        string               `config:"upload_host"`        // Optional alternative host for uploads
+	APIKey            string               `config:"api_key"`            // API authentication token
+	LinkPassword      string               `config:"link_password"`      // Password for public share links
+	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`         // Upload chunk size (auto-aligned to 16 MiB)
+	RootFolderID      string               `config:"root_folder_id"`     // Cached root folder ID
+	UploadConcurrency int                  `config:"upload_concurrency"` // Parallel upload streams per file
+	ChannelID         int64                `config:"channel_id"`         // Telegram channel ID for storage
+	EncryptFiles      bool                 `config:"encrypt_files"`      // Enable server-side encryption
+	PageSize          int64                `config:"page_size"`          // Directory listing page size
+	HashEnabled       bool                 `config:"hash_enabled"`       // Enable BLAKE3 tree hashing
+	Enc               encoder.MultiEncoder `config:"encoding"`           // Filename encoding rules
+}
+
+// Fs represents a remote TelDrive file system.
+// It manages the connection to the TelDrive API, directory cache,
+// rate-limiting pacers, and per-remote configuration.
+type Fs struct {
+	root         string             // Root path on this remote
+	name         string             // Name of this remote in the config
+	opt          Options            // Backend configuration
+	features     *fs.Features       // Optional feature flags for this backend
+	srv          *rest.Client       // HTTP client for API calls
+	pacer        *fs.Pacer          // Rate limiter for API requests
+	ssePacer     *fs.Pacer          // Dedicated pacer for SSE connection retries
+	userId       int64              // Authenticated user ID from session
+	dirCache     *dircache.DirCache // Cached directory tree for fast path resolution
+	rootFolderID string             // Root folder ID on the TelDrive server
+}
+
+// Object represents an teldrive object
+type Object struct {
+	fs       *Fs
+	remote   string
+	id       string
+	size     int64
+	parentId string
+	name     string
+	modTime  time.Time
+	mimeType string
+	hash     string // BLAKE3 tree hash from server
+}
+
+// Name of the remote (as passed into NewFs)
+func (f *Fs) Name() string {
+	return f.name
+}
+
+// Root of the remote (as passed into NewFs)
+func (f *Fs) Root() string {
+	return f.root
+}
+
+// String returns a description of the FS
+func (f *Fs) String() string {
+	return fmt.Sprintf("teldrive root '%s'", f.root)
+}
+
+// Precision of the ModTimes in this Fs
+func (f *Fs) Precision() time.Duration {
+	return time.Second
+}
+
+// Hashes returns the supported hash types of the filesystem
+// TelDrive uses BLAKE3 tree hashing only (16MB fixed blocks)
+func (f *Fs) Hashes() hash.Set {
+	if f.opt.HashEnabled {
+		return hash.Set(telDriveHash)
+	}
+	return hash.NewHashSet(hash.None)
+
+}
+
+// Features returns the optional features of this Fs
+func (f *Fs) Features() *fs.Features {
+	return f.features
+}
+
+// retryErrorCodes is a slice of error codes that we will retry
+var retryErrorCodes = []int{
+	429, // Too Many Requests.
+	500, // Internal Server Error
+	502, // Bad Gateway
+	503, // Service Unavailable
+	504, // Gateway Timeout
+	509, // Bandwidth Limit Exceeded
+}
+
+// shouldRetry returns a boolean as to whether this resp and err
+// deserve to be retried.  It returns the err as a convenience
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
+}
+
+// alignChunkSize rounds the chunk size to the nearest 16MB multiple
+// and clamps it to min/max bounds
+func alignChunkSize(cs fs.SizeSuffix) fs.SizeSuffix {
+	blockSize := int64(16 * 1024 * 1024) // 16MB
+	chunkSizeBytes := min(max(int64(cs), int64(minChunkSize)), int64(maxChunkSize))
+	// Round to nearest 16MB multiple
+	// Ensure we don't exceed max after rounding
+	alignedSize := min(((chunkSizeBytes+blockSize/2)/blockSize)*blockSize, int64(maxChunkSize))
+
+	return fs.SizeSuffix(alignedSize)
+}
+
+func Ptr[T any](t T) *T {
+	return &t
+}
+
+// NewFs makes a new Fs object from the path
+//
+// The path is of the form remote:path
+//
+// Remotes are looked up in the config file.  If the remote isn't
+// found then NotFoundInConfigFile will be returned.
+//
+// On Windows avoid single character remote names as they can be mixed
+// up with drive letters.
+func NewFs(ctx context.Context, name string, root string, config configmap.Mapper) (fs.Fs, error) {
+	opt := new(Options)
+	err := configstruct.Set(config, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	// Align chunk size to 16MB multiple for optimal BLAKE3 tree hashing
+	opt.ChunkSize = alignChunkSize(opt.ChunkSize)
+
+	if opt.ChannelID < 0 {
+		channelIDStr := strconv.FormatInt(opt.ChannelID, 10)
+		// teldrive API expects channel ID without the -100 prefix for supergroups/channels
+		trimmedIDStr := strings.TrimPrefix(channelIDStr, "-100")
+		newID, err := strconv.ParseInt(trimmedIDStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid channel_id: %w", err)
+		}
+		opt.ChannelID = newID
+	}
+
+	f := &Fs{
+		name:  name,
+		root:  root,
+		opt:   *opt,
+		pacer: fs.NewPacer(ctx, pacer.NewDefault()),
+		// Dedicated SSE pacer with optimized settings for connection retries
+		ssePacer: fs.NewPacer(ctx, pacer.NewDefault(
+			pacer.MinSleep(1*time.Second),
+			pacer.MaxSleep(30*time.Second),
+			pacer.DecayConstant(2),
+		)),
+	}
+
+	f.root = strings.Trim(root, "/")
+
+	f.features = (&fs.Features{
+		CanHaveEmptyDirectories: true,
+		ReadMimeType:            true,
+		ChunkWriterDoesntSeek:   true,
+	}).Fill(ctx, f)
+
+	client := fshttp.NewClient(ctx)
+	// Preserve reverse-proxy path prefixes such as /tgd.
+	f.srv = rest.NewClient(client).SetRoot(strings.TrimRight(opt.ApiHost, "/"))
+	if opt.APIKey == "" {
+		return nil, errors.New("missing api_key")
+	}
+	f.srv.SetHeader(apiKeyHeaderName, opt.APIKey)
+
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v1/me",
+	}
+
+	var (
+		session     api.Session
+		sessionResp *http.Response
+	)
+
+	err = f.pacer.Call(func() (bool, error) {
+		sessionResp, err = f.srv.CallJSON(ctx, &opts, nil, &session)
+		return shouldRetry(ctx, sessionResp, err)
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	if session.UserId == 0 {
+		return nil, errors.New("invalid session")
+	}
+
+	f.userId = session.UserId
+
+	// v2 represents the drive root with an omitted parentId rather than a
+	// synthetic root folder object.
+	f.rootFolderID = f.opt.RootFolderID
+	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
+	err = f.dirCache.FindRoot(ctx, false)
+	if err != nil {
+		// Assume it is a file
+		newRoot, remote := dircache.SplitPath(root)
+		tempF := *f
+		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
+		tempF.root = newRoot
+		err = tempF.dirCache.FindRoot(ctx, false)
+		if err != nil {
+			// No root so return old f
+			return f, nil
+		}
+		_, err := tempF.NewObject(ctx, remote)
+		if err != nil {
+			if errors.Is(err, fs.ErrorObjectNotFound) || errors.Is(err, fs.ErrorIsDir) {
+				// File doesn't exist so return old f
+				return f, nil
+			}
+			return nil, err
+		}
+		f.features.Fill(ctx, &tempF)
+		// XXX: update the old f here instead of returning tempF, since
+		// `features` were already filled with functions having *f as a receiver.
+		// See https://github.com/rclone/rclone/issues/2182
+		f.dirCache = tempF.dirCache
+		f.root = tempF.root
+		return f, fs.ErrorIsFile
+
+	}
+	return f, nil
+}
+
+func (f *Fs) readMetaDataForPath(ctx context.Context, path string, options *api.MetadataRequestOptions) (*api.ReadMetadataResponse, error) {
+
+	directoryID, err := f.dirCache.FindDir(ctx, path, false)
+
+	if err != nil {
+		return nil, err
+	}
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v1/files",
+		Parameters: url.Values{
+			"limit": []string{strconv.FormatInt(min(options.Limit, 200), 10)},
+			"sort":  []string{"id"},
+		},
+	}
+	if directoryID != "" {
+		opts.Parameters.Set("parentId", directoryID)
+	}
+	if options.Cursor != "" {
+		opts.Parameters.Set("cursor", options.Cursor)
+	}
+	if options.Status != "" {
+		opts.Parameters.Set("status", options.Status)
+	}
+	var info api.ReadMetadataResponse
+	var resp *http.Response
+
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+func (f *Fs) getRootID(ctx context.Context) (string, error) {
+	return "", nil
+}
+
+func (f *Fs) getFileShares(ctx context.Context, id string) ([]api.FileShare, error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/files/" + id + "/shares",
+	}
+	res := []api.FileShare{}
+	var (
+		resp *http.Response
+		err  error
+	)
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &res)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fs.ErrorObjectNotFound
+		}
+		return nil, err
+	}
+	return res, nil
+}
+
+func (f *Fs) getFileShare(ctx context.Context, id string) (*api.FileShare, error) {
+	res, err := f.getFileShares(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	for i := range res {
+		if res[i].ExpiresAt != nil && res[i].ExpiresAt.UTC().Before(now) {
+			continue
+		}
+		return &res[i], nil
+	}
+	return nil, fs.ErrorObjectNotFound
+}
+
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+
+	opts := &api.MetadataRequestOptions{
+		Limit: f.opt.PageSize,
+	}
+	files := []api.FileInfo{}
+	for {
+		info, err := f.readMetaDataForPath(ctx, dir, opts)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, info.Files...)
+		if info.NextCursor == "" {
+			break
+		}
+		opts.Cursor = info.NextCursor
+	}
+
+	for _, item := range files {
+		remote := path.Join(dir, f.opt.Enc.ToStandardName(item.Name))
+		if item.Type == "folder" {
+			f.dirCache.Put(remote, item.Id)
+			d := fs.NewDir(remote, item.ModTime).SetID(item.Id).SetParentID(item.ParentId).
+				SetSize(item.Size)
+			entries = append(entries, d)
+		}
+		if item.Type == "file" {
+			o, err := f.newObjectWithInfo(ctx, remote, &item)
+			if err != nil {
+				continue
+			}
+			entries = append(entries, o)
+		}
+
+	}
+	return entries, nil
+}
+
+// Return an Object from a path
+//
+// If it can't be found it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) newObjectWithInfo(_ context.Context, remote string, info *api.FileInfo) (fs.Object, error) {
+	if info == nil {
+		return nil, fs.ErrorObjectNotFound
+	}
+	o := &Object{
+		fs:       f,
+		remote:   remote,
+		id:       info.Id,
+		size:     info.Size,
+		parentId: info.ParentId,
+		name:     info.Name,
+		modTime:  info.ModTime,
+		mimeType: info.MimeType,
+		hash: func() string {
+			if info.Hash != nil {
+				return info.Hash.Value
+			}
+			return ""
+		}(),
+	}
+	if info.Type == "folder" {
+		return o, fs.ErrorIsDir
+	}
+	return o, nil
+}
+
+// NewObject finds the Object at remote.  If it can't be found it
+// returns the error fs.ErrorObjectNotFound.
+func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	leaf, directoryID, err := f.dirCache.FindPath(ctx, remote, false)
+	if err != nil {
+		if err == fs.ErrorDirNotFound {
+			return nil, fs.ErrorObjectNotFound
+		}
+	}
+
+	res, err := f.findObject(ctx, directoryID, leaf)
+	if err != nil || len(res) == 0 {
+		return nil, fs.ErrorObjectNotFound
+	}
+	if res[0].Type == "folder" {
+		return nil, fs.ErrorIsDir
+	}
+
+	return f.newObjectWithInfo(ctx, remote, &res[0])
+}
+
+func (f *Fs) findObject(ctx context.Context, pathID, leaf string) ([]api.FileInfo, error) {
+	params := url.Values{"limit": []string{"200"}, "sort": []string{"id"}}
+	if pathID != "" {
+		params.Set("parentId", pathID)
+	}
+	var found []api.FileInfo
+	for {
+		var info api.ReadMetadataResponse
+		opts := rest.Opts{Method: "GET", Path: "/api/v1/files", Parameters: params}
+		err := f.pacer.Call(func() (bool, error) {
+			resp, err := f.srv.CallJSON(ctx, &opts, nil, &info)
+			return shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range info.Files {
+			if item.Name == leaf {
+				found = append(found, item)
+			}
+		}
+		if len(found) > 0 || info.NextCursor == "" {
+			return found, nil
+		}
+		params.Set("cursor", info.NextCursor)
+	}
+}
+
+func (f *Fs) moveTo(ctx context.Context, id, srcLeaf, dstLeaf, srcDirectoryID, dstDirectoryID string) error {
+
+	if srcDirectoryID != dstDirectoryID {
+		opts := rest.Opts{
+			Method:       "POST",
+			Path:         "/api/v1/files/" + id + "/move",
+			NoResponse:   true,
+			ExtraHeaders: map[string]string{"Idempotency-Key": stableUUID("move:" + id + ":" + dstDirectoryID)},
+		}
+		mv := api.MoveFileRequest{
+			Destination:    dstDirectoryID,
+			ConflictPolicy: "replace",
+		}
+		err := f.pacer.Call(func() (bool, error) {
+			resp, err := f.srv.CallJSON(ctx, &opts, &mv, nil)
+			return shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			return fmt.Errorf("couldn't move file: %w", err)
+		}
+	}
+	if srcLeaf != dstLeaf {
+		err := f.updateFileInformation(ctx, &api.UpdateFileInformation{Name: dstLeaf}, id)
+		if err != nil {
+			return fmt.Errorf("move: failed rename: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// updateFileInformation set's various file attributes most importantly it's name
+func (f *Fs) updateFileInformation(ctx context.Context, update *api.UpdateFileInformation, fileId string) (err error) {
+	opts := rest.Opts{
+		Method:     "PATCH",
+		Path:       "/api/v1/files/" + fileId,
+		NoResponse: true,
+	}
+
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &opts, update, nil)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't update file info: %w", err)
+	}
+	return err
+}
+
+func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.OpenOption) error {
+	o := &Object{
+		fs: f,
+	}
+
+	var uploadInfo *uploadInfo
+	var err error
+	size := src.Size()
+
+	if size < 0 {
+		// Unknown size - buffer to memory/temp file first
+		fs.Debugf(f, "putUnchecked: unknown size, buffering to memory (threshold: %d bytes)", memoryBufferThreshold)
+		uploadInfo, size, err = o.uploadWithBuffering(ctx, src.Remote(), in, src)
+		if err != nil {
+			return err
+		}
+		// Create new src with known size for createFile
+		src = object.NewStaticObjectInfo(src.Remote(), src.ModTime(ctx), size, false, nil, f)
+	} else {
+		uploadInfo, err = o.uploadMultipart(ctx, src.Remote(), in, src)
+		if err != nil {
+			return err
+		}
+	}
+
+	return o.createFile(ctx, src, uploadInfo)
+}
+
+// FindLeaf finds a directory of name leaf in the folder with ID pathID
+func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
+	files, err := f.findObject(ctx, pathID, leaf)
+	if err != nil {
+		return "", false, err
+	}
+	if len(files) == 0 {
+		return "", false, nil
+	}
+	if files[0].Type == "file" {
+		return "", false, fs.ErrorIsFile
+	}
+	return files[0].Id, true, nil
+}
+
+// Put in to the remote path with the modTime given of the given size
+//
+// When called from outside an Fs by rclone, src.Size() will always be >= 0.
+// But for unknown-sized objects (indicated by src.Size() == -1), Put should either
+// return an error or upload it properly (rather than e.g. calling panic).
+//
+// May create the object even if it returns an error - if so
+// will return the object and the error, otherwise will return
+// nil and the error
+func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	existingObj, err := f.NewObject(ctx, src.Remote())
+	switch err {
+	case nil:
+		return existingObj, existingObj.Update(ctx, in, src, options...)
+	case fs.ErrorObjectNotFound:
+		// Not found so create it
+		return f.PutUnchecked(ctx, in, src, options...)
+	default:
+		return nil, err
+	}
+}
+
+// PutUnchecked uploads the object
+//
+// This will create a duplicate if we upload a new file without
+// checking to see if there is one already - use Put() for that.
+func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	err := f.putUnchecked(ctx, in, src, options...)
+	if err != nil {
+		return nil, err
+	}
+	return f.NewObject(ctx, src.Remote())
+}
+
+// Update the already existing object
+//
+// Copy the reader into the object updating modTime and size.
+//
+// The new object may have been created if an error is returned
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	remote := o.Remote()
+	var uploadInfo *uploadInfo
+	var err error
+	if src.Size() < 0 {
+		uploadInfo, _, err = o.uploadWithBuffering(ctx, remote, in, src)
+	} else {
+		uploadInfo, err = o.uploadMultipart(ctx, remote, in, src)
+	}
+	if err != nil {
+		return err
+	}
+	if err = o.createFile(ctx, src, uploadInfo); err != nil {
+		return err
+	}
+	if refreshed, findErr := o.fs.NewObject(ctx, remote); findErr == nil {
+		if replacement, ok := refreshed.(*Object); ok {
+			*o = *replacement
+		}
+	}
+	return nil
+}
+
+// ChangeNotify calls the passed function with a path that has had changes.
+func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case pollInterval, ok := <-pollIntervalChan:
+				if !ok {
+					fs.Debugf(f, "ChangeNotify: channel closed, stopping")
+					return
+				}
+				if pollInterval > 0 {
+					fs.Debugf(f, "ChangeNotify: poll interval set but SSE is active, ignoring")
+				}
+			default:
+				fs.Debugf(f, "Starting SSE event stream")
+				err := f.changeNotifySSE(ctx, notifyFunc)
+				if err != nil {
+					fs.Infof(f, "SSE connection failed permanently: %s", err)
+					return
+				}
+			}
+		}
+	}()
+}
+
+func isFatalError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "401") ||
+		strings.Contains(errStr, "403") ||
+		strings.Contains(errStr, "404")
+}
+
+func (f *Fs) changeNotifySSE(ctx context.Context, notifyFunc func(string, fs.EntryType)) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		var connErr error
+		err := f.ssePacer.Call(func() (bool, error) {
+			connErr = f.connectAndProcessSSE(ctx, notifyFunc)
+			if connErr == nil {
+				return false, nil
+			}
+			if fserrors.ContextError(ctx, &connErr) {
+				return false, connErr
+			}
+			if isFatalError(connErr) {
+				return false, connErr
+			}
+			return true, connErr
+		})
+
+		if err != nil {
+			return err
+		}
+
+		fs.Debugf(f, "SSE connection ended, will retry")
+	}
+}
+
+func (f *Fs) connectAndProcessSSE(ctx context.Context, notifyFunc func(string, fs.EntryType)) error {
+	opts := rest.Opts{
+		Method:      "GET",
+		Path:        "/api/events/stream",
+		ContentType: "text/event-stream",
+		ExtraHeaders: map[string]string{
+			"Accept":        "text/event-stream",
+			"Cache-Control": "no-cache",
+		},
+	}
+
+	resp, err := f.srv.Call(ctx, &opts)
+	if err != nil {
+		return fmt.Errorf("failed to connect to SSE endpoint: %w", err)
+	}
+	if resp == nil || resp.Body == nil {
+		return fmt.Errorf("no response from SSE endpoint")
+	}
+	defer resp.Body.Close()
+
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.Contains(contentType, "text/event-stream") {
+		return fmt.Errorf("unexpected content type: %s", contentType)
+	}
+
+	fs.Debugf(f, "SSE connection established")
+	reader := bufio.NewReader(resp.Body)
+	var eventData strings.Builder
+
+	for {
+
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				return fmt.Errorf("SSE stream closed by server")
+			}
+			return fmt.Errorf("error reading SSE stream: %w", err)
+		}
+
+		line = strings.TrimRight(line, "\r\n")
+
+		if line == "" {
+			if eventData.Len() > 0 {
+				data := eventData.String()
+				eventData.Reset()
+
+				if err := f.processSSEEvent(data, notifyFunc); err != nil {
+					fs.Debugf(f, "Failed to process SSE event: %s", err)
+				}
+			}
+			continue
+		}
+
+		if strings.HasPrefix(line, "data: ") {
+			eventData.WriteString(line[6:])
+		}
+	}
+}
+
+func (f *Fs) processSSEEvent(data string, notifyFunc func(string, fs.EntryType)) error {
+	var event api.Event
+	if err := json.Unmarshal([]byte(data), &event); err != nil {
+		return fmt.Errorf("failed to unmarshal event: %w", err)
+	}
+
+	// Get parent path from cache
+	parentPath, ok := f.dirCache.GetInv(event.Source.ParentId)
+	if !ok {
+		fs.Debugf(f, "SSE: skipping event for uncached parent %s", event.Source.ParentId)
+		return nil
+	}
+
+	fullPath := path.Join(parentPath, event.Source.Name)
+
+	var entryType fs.EntryType
+	switch event.Source.Type {
+	case "folder":
+		entryType = fs.EntryDirectory
+	case "file":
+		entryType = fs.EntryObject
+	default:
+		entryType = fs.EntryObject
+	}
+
+	// Handle move events - notify both old and new locations
+	if event.Type == "files.moved" && event.Source.DestParentId != "" {
+		if newParentPath, ok := f.dirCache.GetInv(event.Source.DestParentId); ok {
+			newPath := path.Join(newParentPath, event.Source.Name)
+			fs.Debugf(f, "SSE move event: new path %s", newPath)
+			notifyFunc(newPath, entryType)
+		}
+	}
+
+	fs.Debugf(f, "SSE event: %s (%v, type=%s)", fullPath, entryType, event.Type)
+	notifyFunc(fullPath, entryType)
+
+	return nil
+}
+
+// PutStream uploads to the remote path with the modTime given of indeterminate size
+func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.Put(ctx, in, src, options...)
+}
+
+// OpenChunkWriter returns the chunk size and a ChunkWriter
+//
+// Pass in the remote and the src object
+// You can also use options to hint at the desired chunk size
+func (f *Fs) OpenChunkWriter(
+	ctx context.Context,
+	remote string,
+	src fs.ObjectInfo,
+	options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
+
+	o := &Object{
+		fs:     f,
+		remote: remote,
+	}
+
+	// The v2 API needs the final size when creating an upload session.
+	if src.Size() <= 0 {
+		return info, nil, errors.New("chunk writer requires a known size; use rcat --size for streamed uploads")
+	}
+
+	uploadInfo, err := o.prepareUpload(ctx, remote, src)
+
+	if err != nil {
+		return info, nil, fmt.Errorf("failed to prepare upload: %w", err)
+	}
+
+	chunkWriter := &objectChunkWriter{
+		f:          f,
+		src:        src,
+		o:          o,
+		uploadInfo: uploadInfo,
+	}
+	info = fs.ChunkWriterInfo{
+		ChunkSize:         uploadInfo.chunkSize,
+		Concurrency:       o.fs.opt.UploadConcurrency,
+		LeavePartsOnError: true,
+	}
+	fs.Debugf(o, "open chunk writer: started upload: %v", uploadInfo.uploadID)
+	return info, chunkWriter, err
+}
+
+// CreateDir makes a directory with pathID as parent and name leaf
+func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
+	opts := rest.Opts{
+		Method:       "POST",
+		Path:         "/api/v1/folders",
+		ExtraHeaders: map[string]string{"Idempotency-Key": stableUUID("mkdir:" + pathID + ":" + leaf)},
+	}
+	mkdir := api.FolderCreateRequest{
+		Name: leaf, ParentID: pathID, ConflictPolicy: "fail",
+	}
+	info := api.FileInfo{}
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &opts, &mkdir, &info)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return "", err
+	}
+	return info.Id, nil
+}
+
+// Mkdir makes the directory (container, bucket)
+//
+// Shouldn't return an error if it already exists
+func (f *Fs) Mkdir(ctx context.Context, dir string) (err error) {
+	_, err = f.dirCache.FindDir(ctx, dir, true)
+	return err
+}
+
+func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
+	root := path.Join(f.root, dir)
+	if root == "" {
+		return errors.New("can't purge root directory")
+	}
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return err
+	}
+
+	if check {
+		info, err := f.readMetaDataForPath(ctx, dir, &api.MetadataRequestOptions{
+			Limit: 1,
+		})
+		if err != nil {
+			return err
+		}
+		if len(info.Files) > 0 {
+			return fs.ErrorDirectoryNotEmpty
+		}
+	}
+
+	opts := rest.Opts{Method: "DELETE", Path: "/api/v1/files/" + directoryID, NoResponse: true}
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.Call(ctx, &opts)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return err
+	}
+	f.dirCache.FlushDir(dir)
+	return nil
+}
+
+// Rmdir removes the directory (container, bucket) if empty
+//
+// Return an error if it doesn't exist or isn't empty
+func (f *Fs) Rmdir(ctx context.Context, dir string) (err error) {
+	return f.purgeCheck(ctx, dir, true)
+}
+
+// Purge all files in the directory specified
+//
+// Implement this if you have a way of deleting all the files
+// quicker than just running Remove() on the result of List()
+//
+// Return an error if it doesn't exist
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, false)
+}
+
+// Move src to this remote using server-side move operations.
+//
+// This is stored with the remote path given.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantMove
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't move - not same remote type")
+		return nil, fs.ErrorCantMove
+	}
+
+	srcLeaf, srcParentID, err := srcObj.fs.dirCache.FindPath(ctx, src.Remote(), false)
+	if err != nil {
+		return nil, err
+	}
+
+	dstLeaf, directoryID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+
+	err = f.moveTo(ctx, srcObj.id, srcLeaf, dstLeaf, srcParentID, directoryID)
+	if err != nil {
+		return nil, err
+	}
+	f.dirCache.FlushDir(src.Remote())
+	newObj := *srcObj
+	newObj.remote = remote
+	newObj.fs = f
+	return &newObj, nil
+}
+
+// DirMove moves src, srcRemote to this remote at dstRemote
+// using server-side move operations.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantDirMove
+
+// If destination exists then return fs.ErrorDirExists
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	srcFs, ok := src.(*Fs)
+	if !ok {
+		fs.Debugf(srcFs, "Can't move directory - not same remote type")
+		return fs.ErrorCantDirMove
+	}
+	srcID, srcDirectoryID, srcLeaf, dstDirectoryID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	if err != nil {
+		return err
+	}
+	err = f.moveTo(ctx, srcID, srcLeaf, dstLeaf, srcDirectoryID, dstDirectoryID)
+	if err != nil {
+		return fmt.Errorf("dirmove: failed to move: %w", err)
+	}
+	srcFs.dirCache.FlushDir(srcRemote)
+	return nil
+}
+
+func (o *Object) Remove(ctx context.Context) error {
+	opts := rest.Opts{Method: "DELETE", Path: "/api/v1/files/" + o.id, NoResponse: true}
+	err := o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.Call(ctx, &opts)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// PublicLink adds a "readable by anyone with link" permission on the given file or folder.
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (link string, err error) {
+	id, err := f.dirCache.FindDir(ctx, remote, false)
+	if err == nil {
+		fs.Debugf(f, "attempting to share directory '%s'", remote)
+	} else {
+		fs.Debugf(f, "attempting to share single file '%s'", remote)
+		o, err := f.NewObject(ctx, remote)
+		if err != nil {
+			return "", err
+		}
+		id = o.(fs.IDer).ID()
+	}
+	if unlink {
+		shares, err := f.getFileShares(ctx, id)
+		if err != nil {
+			if errors.Is(err, fs.ErrorObjectNotFound) {
+				return "", nil
+			}
+			return "", err
+		}
+		now := time.Now().UTC()
+		for _, share := range shares {
+			if share.ExpiresAt != nil && share.ExpiresAt.UTC().Before(now) {
+				continue
+			}
+			opts := rest.Opts{
+				Method:     "DELETE",
+				Path:       "/api/files/" + id + "/shares/" + share.ID,
+				NoResponse: true,
+			}
+			err = f.pacer.Call(func() (bool, error) {
+				resp, err := f.srv.Call(ctx, &opts)
+				return shouldRetry(ctx, resp, err)
+			})
+			if err != nil {
+				return "", err
+			}
+		}
+		return "", nil
+	}
+
+	recreate := f.opt.LinkPassword != "" || expire < fs.DurationOff
+	share, err := f.getFileShare(ctx, id)
+	if err != nil {
+		if !errors.Is(err, fs.ErrorObjectNotFound) {
+			return "", err
+		}
+		share = nil
+	} else if recreate {
+		shares, err := f.getFileShares(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		now := time.Now().UTC()
+		for _, existingShare := range shares {
+			if existingShare.ExpiresAt != nil && existingShare.ExpiresAt.UTC().Before(now) {
+				continue
+			}
+			opts := rest.Opts{
+				Method:     "DELETE",
+				Path:       "/api/files/" + id + "/shares/" + existingShare.ID,
+				NoResponse: true,
+			}
+			err = f.pacer.Call(func() (bool, error) {
+				resp, err := f.srv.Call(ctx, &opts)
+				return shouldRetry(ctx, resp, err)
+			})
+			if err != nil {
+				return "", err
+			}
+		}
+		share = nil
+	}
+	if share == nil {
+		opts := rest.Opts{
+			Method:     "POST",
+			Path:       "/api/files/" + id + "/shares",
+			NoResponse: true,
+		}
+		payload := api.FileShareCreate{}
+		if f.opt.LinkPassword != "" {
+			payload.Password = f.opt.LinkPassword
+		}
+		if expire < fs.DurationOff {
+			dur := time.Now().Add(time.Duration(expire)).UTC()
+			payload.ExpiresAt = &dur
+		}
+		err = f.pacer.Call(func() (bool, error) {
+			resp, err := f.srv.CallJSON(ctx, &opts, &payload, nil)
+			return shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			return "", err
+		}
+		share, err = f.getFileShare(ctx, id)
+		if err != nil {
+			return "", err
+		}
+	}
+	return fmt.Sprintf("%s/share/%s", f.opt.ApiHost, share.ID), nil
+}
+
+// Open an object for read
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+	var resp *http.Response
+
+	fs.FixRangeOption(options, o.size)
+
+	opts := rest.Opts{
+		Method:  "GET",
+		Path:    fmt.Sprintf("/api/v1/files/%s/content", o.id),
+		Options: options,
+	}
+
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err = o.fs.srv.Call(ctx, &opts)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, err
+}
+
+// Copy src to this remote using server-side copy operations.
+//
+// This is stored with the remote path given.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantCopy
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't copy - not same remote type")
+		return nil, fs.ErrorCantCopy
+	}
+	srcLeaf, srcParentID, err := srcObj.fs.dirCache.FindPath(ctx, src.Remote(), false)
+	if err != nil {
+		return nil, err
+	}
+	dstLeaf, directoryID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+
+	if srcParentID == directoryID && dstLeaf == srcLeaf {
+		fs.Debugf(src, "Can't copy - change file name")
+		return nil, fs.ErrorCantCopy
+	}
+
+	opts := rest.Opts{
+		Method:       "POST",
+		Path:         "/api/v1/files/" + srcObj.id + "/copy",
+		ExtraHeaders: map[string]string{"Idempotency-Key": stableUUID("copy:" + srcObj.id + ":" + directoryID + ":" + dstLeaf)},
+	}
+	payload := api.FileCopy{
+		Destination:    directoryID,
+		NewName:        dstLeaf,
+		UpdatedAt:      srcObj.ModTime(ctx).UTC(),
+		ConflictPolicy: "replace",
+	}
+	var info api.FileInfo
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &opts, &payload, &info)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return f.newObjectWithInfo(ctx, remote, &info)
+}
+
+// About gets quota information
+func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v1/files/statistics/categories",
+	}
+	var stats []api.CategorySize
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &opts, nil, &stats)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read user info: %w", err)
+	}
+
+	total := int64(0)
+	for category := range stats {
+		total += stats[category].TotalSize
+	}
+	return &fs.Usage{Used: fs.NewUsageValue(total)}, nil
+}
+
+// Fs returns the parent Fs
+func (o *Object) Fs() fs.Info {
+	return o.fs
+}
+
+// Return a string version
+func (o *Object) String() string {
+	if o == nil {
+		return "<nil>"
+	}
+	return o.remote
+}
+
+// Remote returns the remote path
+func (o *Object) Remote() string {
+	return o.remote
+}
+
+// ModTime returns the modification time of the object
+//
+// It attempts to read the objects mtime and if that isn't present the
+// LastModified returned in the http headers
+func (o *Object) ModTime(ctx context.Context) time.Time {
+	return o.modTime
+}
+
+func (o *Object) MimeType(ctx context.Context) string {
+	return o.mimeType
+}
+
+// Size returns the size of an object in bytes
+func (o *Object) Size() int64 {
+	return o.size
+}
+
+func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
+	if t != telDriveHash {
+		return "", hash.ErrUnsupported
+	}
+
+	if o.hash != "" {
+		return o.hash, nil
+	}
+
+	// Fetch from server if not cached
+	var file api.FileInfo
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/api/v1/files/" + o.id,
+	}
+
+	err := o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &file)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to get file hash: %w", err)
+	}
+
+	if file.Hash != nil && file.Hash.Value != "" {
+		o.hash = file.Hash.Value
+		return o.hash, nil
+	}
+
+	return "", hash.ErrUnsupported
+}
+
+// ID returns the ID of the Object if known, or "" if not
+func (o *Object) ID() string {
+	return o.id
+}
+
+// ParentID implements fs.ParentIDer.
+func (o *Object) ParentID() string {
+	return o.parentId
+}
+
+// Storable returns whether this object is storable
+func (o *Object) Storable() bool {
+	return true
+}
+
+// SetModTime sets the modification time of the local fs object
+func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
+	updateInfo := &api.UpdateFileInformation{
+		ModTime: Ptr(modTime.UTC()),
+	}
+	err := o.fs.updateFileInformation(ctx, updateInfo, o.id)
+	if err != nil {
+		return fmt.Errorf("couldn't update mod time: %w", err)
+	}
+	o.modTime = modTime
+	return nil
+}
+
+// DirCacheFlush an optional interface to flush internal directory cache
+// DirCacheFlush resets the directory cache - used in testing
+// as an optional interface
+func (f *Fs) DirCacheFlush() {
+	f.dirCache.ResetRoot()
+}
+
+// Check the interfaces are satisfied
+var (
+	_ fs.Fs              = (*Fs)(nil)
+	_ fs.Copier          = (*Fs)(nil)
+	_ fs.Mover           = (*Fs)(nil)
+	_ fs.DirMover        = (*Fs)(nil)
+	_ fs.Object          = (*Object)(nil)
+	_ fs.MimeTyper       = &Object{}
+	_ fs.OpenChunkWriter = (*Fs)(nil)
+	_ fs.IDer            = (*Object)(nil)
+	_ fs.DirCacheFlusher = (*Fs)(nil)
+	_ fs.PublicLinker    = (*Fs)(nil)
+	_ fs.ParentIDer      = (*Object)(nil)
+	_ fs.Abouter         = (*Fs)(nil)
+)

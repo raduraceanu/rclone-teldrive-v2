@@ -1,0 +1,15 @@
+pkgbase = rclone-teldrive-git
+	pkgdesc = Rclone with TelDrive v2 API and proxied path-prefix support
+	pkgver = r1.d53e125
+	pkgrel = 1
+	url = https://github.com/JSJ-Experiments/rclone-teldrive
+	arch = x86_64
+	license = MIT
+	provides = rclone
+	conflicts = rclone
+	makedepends = git
+	makedepends = go
+	source = rclone-teldrive::git+https://github.com/JSJ-Experiments/rclone-teldrive.git#branch=main
+	sha256sums = SKIP
+
+pkgname = rclone-teldrive-git

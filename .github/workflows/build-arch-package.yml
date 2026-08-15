@@ -1,0 +1,85 @@
+name: Build Arch package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm archlinux-keyring
+          pacman -S --noconfirm --needed base-devel git go
+
+      - name: Check out source and package definition
+        uses: actions/checkout@v4
+
+      - name: Resolve source commit
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="${GITHUB_SHA}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha:0:12}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$sha" > upstream-commit.txt
+
+      - name: Create unprivileged build user
+        run: |
+          useradd --create-home --shell /bin/bash builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          printf 'builder ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder
+
+      - name: Build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          runuser -u builder -- bash -lc '
+            set -euo pipefail
+            cd "$GITHUB_WORKSPACE"
+            makepkg --syncdeps --noconfirm --cleanbuild --clean
+          '
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          packages=( ./*.pkg.tar.* )
+          (( ${#packages[@]} > 0 )) || { echo 'No package was produced' >&2; exit 1; }
+          for package in "${packages[@]}"; do
+            cp "$package" dist/
+            sha256sum "$package" > "dist/$(basename "$package").sha256"
+          done
+          cp upstream-commit.txt dist/
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-teldrive-git-${{ steps.source.outputs.short_sha }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: teldrive-${{ steps.source.outputs.short_sha }}
+          name: rclone TelDrive ${{ steps.source.outputs.short_sha }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Arch Linux package for the TelDrive v2/path-prefix fork.
+
+            Source commit: `${{ steps.source.outputs.sha }}`
+          files: dist/*
+          fail_on_unmatched_files: true
+          overwrite_files: true
