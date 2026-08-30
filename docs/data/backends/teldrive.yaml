@@ -1,0 +1,16 @@
+backend: teldrive
+name: Tel Drive
+tier: Tier 3
+maintainers: ""
+features_score: 0
+integration_tests: ""
+data_integrity: ""
+performance: ""
+adoption: ""
+docs: ""
+security: ""
+virtual: false
+remote: ""
+features: []
+hashes: []
+precision: 1000000000
