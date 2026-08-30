@@ -1,197 +1,386 @@
-<!-- markdownlint-disable-next-line first-line-heading no-inline-html -->
-[<img src="https://rclone.org/img/logo_on_light__horizontal_color.svg" width="50%" alt="rclone logo">](https://rclone.org/#gh-light-mode-only)
-<!-- markdownlint-disable-next-line no-inline-html -->
-[<img src="https://rclone.org/img/logo_on_dark__horizontal_color.svg" width="50%" alt="rclone logo">](https://rclone.org/#gh-dark-mode-only)
+# rclone with TelDrive v2
 
-[Website](https://rclone.org) |
-[Documentation](https://rclone.org/docs/) |
-[Download](https://rclone.org/downloads/) |
-[Contributing](CONTRIBUTING.md) |
-[Changelog](https://rclone.org/changelog/) |
-[Installation](https://rclone.org/install/) |
-[Forum](https://forum.rclone.org/)
+A custom build of [rclone](https://rclone.org/) with **TelDrive v2 backend support**.
 
-[![Build Status](https://github.com/rclone/rclone/workflows/build/badge.svg)](https://github.com/rclone/rclone/actions?query=workflow%3Abuild)
-[![Go Report Card](https://goreportcard.com/badge/github.com/rclone/rclone)](https://goreportcard.com/report/github.com/rclone/rclone)
-[![GoDoc](https://godoc.org/github.com/rclone/rclone?status.svg)](https://godoc.org/github.com/rclone/rclone)
-[![Docker Pulls](https://img.shields.io/docker/pulls/rclone/rclone)](https://hub.docker.com/r/rclone/rclone)
+TelDrive provides a file-storage layer backed by Telegram, while rclone provides the familiar command-line interface for copying, syncing, mounting, and managing files.
 
-# Rclone
-
-Rclone *("rsync for cloud storage")* is a command-line program to sync files and
-directories to and from different cloud storage providers.
-
-## Storage providers
-
-- 1Fichier [:page_facing_up:](https://rclone.org/fichier/)
-- Akamai Netstorage [:page_facing_up:](https://rclone.org/netstorage/)
-- Alibaba Cloud (Aliyun) Object Storage System (OSS) [:page_facing_up:](https://rclone.org/s3/#alibaba-oss)
-- Amazon S3 [:page_facing_up:](https://rclone.org/s3/)
-- ArvanCloud Object Storage (AOS) [:page_facing_up:](https://rclone.org/s3/#arvan-cloud-object-storage-aos)
-- Bizfly Cloud Simple Storage [:page_facing_up:](https://rclone.org/s3/#bizflycloud)
-- Backblaze B2 [:page_facing_up:](https://rclone.org/b2/)
-- Box [:page_facing_up:](https://rclone.org/box/)
-- Ceph [:page_facing_up:](https://rclone.org/s3/#ceph)
-- China Mobile Ecloud Elastic Object Storage (EOS) [:page_facing_up:](https://rclone.org/s3/#china-mobile-ecloud-eos)
-- Citrix ShareFile [:page_facing_up:](https://rclone.org/sharefile/)
-- Cloudflare R2 [:page_facing_up:](https://rclone.org/s3/#cloudflare-r2)
-- Cloudinary [:page_facing_up:](https://rclone.org/cloudinary/)
-- Cubbit DS3 [:page_facing_up:](https://rclone.org/s3/#Cubbit)
-- DigitalOcean Spaces [:page_facing_up:](https://rclone.org/s3/#digitalocean-spaces)
-- Digi Storage [:page_facing_up:](https://rclone.org/koofr/#digi-storage)
-- Dreamhost [:page_facing_up:](https://rclone.org/s3/#dreamhost)
-- Drime [:page_facing_up:](https://rclone.org/s3/#drime)
-- Dropbox [:page_facing_up:](https://rclone.org/dropbox/)
-- Enterprise File Fabric [:page_facing_up:](https://rclone.org/filefabric/)
-- Exaba [:page_facing_up:](https://rclone.org/s3/#exaba)
-- Fastly Object Storage [:page_facing_up:](https://rclone.org/s3/#fastly)
-- Fastmail Files [:page_facing_up:](https://rclone.org/webdav/#fastmail-files)
-- FileLu [:page_facing_up:](https://rclone.org/filelu/)
-- Filen [:page_facing_up:](https://rclone.org/filen/)
-- Files.com [:page_facing_up:](https://rclone.org/filescom/)
-- FlashBlade [:page_facing_up:](https://rclone.org/s3/#pure-storage-flashblade)
-- FTP [:page_facing_up:](https://rclone.org/ftp/)
-- GoFile [:page_facing_up:](https://rclone.org/gofile/)
-- Google Cloud Storage [:page_facing_up:](https://rclone.org/googlecloudstorage/)
-- Google Drive [:page_facing_up:](https://rclone.org/drive/)
-- Google Photos [:page_facing_up:](https://rclone.org/googlephotos/)
-- HDFS (Hadoop Distributed Filesystem) [:page_facing_up:](https://rclone.org/hdfs/)
-- Hetzner Object Storage [:page_facing_up:](https://rclone.org/s3/#hetzner)
-- Hetzner Storage Box [:page_facing_up:](https://rclone.org/sftp/#hetzner-storage-box)
-- HiDrive [:page_facing_up:](https://rclone.org/hidrive/)
-- Hitachi Content Platform (HCP) [:page_facing_up:](https://rclone.org/s3/#hcp)
-- HTTP [:page_facing_up:](https://rclone.org/http/)
-- Huawei Cloud Object Storage Service(OBS) [:page_facing_up:](https://rclone.org/s3/#huawei-obs)
-- Huawei Drive [:page_facing_up:](https://rclone.org/huaweidrive/)
-- iCloud Drive [:page_facing_up:](https://rclone.org/iclouddrive/)
-- ImageKit [:page_facing_up:](https://rclone.org/imagekit/)
-- Internet Archive [:page_facing_up:](https://rclone.org/internetarchive/)
-- Internxt [:page_facing_up:](https://rclone.org/internxt/)
-- Jottacloud [:page_facing_up:](https://rclone.org/jottacloud/)
-- IBM COS S3 [:page_facing_up:](https://rclone.org/s3/#ibm-cos-s3)
-- Impossible Cloud [:page_facing_up:](https://rclone.org/s3/#impossible-cloud)
-- Intercolo Object Storage [:page_facing_up:](https://rclone.org/s3/#intercolo)
-- IONOS Cloud [:page_facing_up:](https://rclone.org/s3/#ionos)
-- Koofr [:page_facing_up:](https://rclone.org/koofr/)
-- Leviia Object Storage [:page_facing_up:](https://rclone.org/s3/#leviia)
-- Liara Object Storage [:page_facing_up:](https://rclone.org/s3/#liara-object-storage)
-- Linkbox [:page_facing_up:](https://rclone.org/linkbox)
-- Linode Object Storage [:page_facing_up:](https://rclone.org/s3/#linode)
-- Magalu Object Storage [:page_facing_up:](https://rclone.org/s3/#magalu)
-- Mail.ru Cloud [:page_facing_up:](https://rclone.org/mailru/)
-- Memset Memstore [:page_facing_up:](https://rclone.org/swift/)
-- MEGA [:page_facing_up:](https://rclone.org/mega/)
-- MEGA S4 Object Storage [:page_facing_up:](https://rclone.org/s3/#mega)
-- Memory [:page_facing_up:](https://rclone.org/memory/)
-- Microsoft Azure Blob Storage [:page_facing_up:](https://rclone.org/azureblob/)
-- Microsoft Azure Files Storage [:page_facing_up:](https://rclone.org/azurefiles/)
-- Microsoft OneDrive [:page_facing_up:](https://rclone.org/onedrive/)
-- Minio [:page_facing_up:](https://rclone.org/s3/#minio)
-- Nextcloud [:page_facing_up:](https://rclone.org/webdav/#nextcloud)
-- Blomp Cloud Storage [:page_facing_up:](https://rclone.org/swift/)
-- OpenDrive [:page_facing_up:](https://rclone.org/opendrive/)
-- OpenStack Swift [:page_facing_up:](https://rclone.org/swift/)
-- Oracle Cloud Storage [:page_facing_up:](https://rclone.org/swift/)
-- Oracle Object Storage [:page_facing_up:](https://rclone.org/oracleobjectstorage/)
-- Outscale [:page_facing_up:](https://rclone.org/s3/#outscale)
-- OVHcloud Object Storage (Swift) [:page_facing_up:](https://rclone.org/swift/)
-- OVHcloud Object Storage (S3-compatible) [:page_facing_up:](https://rclone.org/s3/#ovhcloud)
-- ownCloud [:page_facing_up:](https://rclone.org/webdav/#owncloud)
-- pCloud [:page_facing_up:](https://rclone.org/pcloud/)
-- Petabox [:page_facing_up:](https://rclone.org/s3/#petabox)
-- PikPak [:page_facing_up:](https://rclone.org/pikpak/)
-- Pixeldrain [:page_facing_up:](https://rclone.org/pixeldrain/)
-- premiumize.me [:page_facing_up:](https://rclone.org/premiumizeme/)
-- put.io [:page_facing_up:](https://rclone.org/putio/)
-- Proton Drive [:page_facing_up:](https://rclone.org/protondrive/)
-- QingStor [:page_facing_up:](https://rclone.org/qingstor/)
-- Qiniu Cloud Object Storage (Kodo) [:page_facing_up:](https://rclone.org/s3/#qiniu)
-- Rabata Cloud Storage [:page_facing_up:](https://rclone.org/s3/#Rabata)
-- Quatrix [:page_facing_up:](https://rclone.org/quatrix/)
-- Rackspace Cloud Files [:page_facing_up:](https://rclone.org/swift/)
-- RackCorp Object Storage [:page_facing_up:](https://rclone.org/s3/#RackCorp)
-- rsync.net [:page_facing_up:](https://rclone.org/sftp/#rsync-net)
-- Scaleway [:page_facing_up:](https://rclone.org/s3/#scaleway)
-- Scality (RING / ARTESCA) [:page_facing_up:](https://rclone.org/s3/#scality)
-- Seafile [:page_facing_up:](https://rclone.org/seafile/)
-- Seagate Lyve Cloud [:page_facing_up:](https://rclone.org/s3/#lyve)
-- SeaweedFS [:page_facing_up:](https://rclone.org/s3/#seaweedfs)
-- Selectel Object Storage [:page_facing_up:](https://rclone.org/s3/#selectel)
-- Servercore Object Storage [:page_facing_up:](https://rclone.org/s3/#servercore)
-- SFTP [:page_facing_up:](https://rclone.org/sftp/)
-- Shade [:page_facing_up:](https://rclone.org/shade/)
-- SMB / CIFS [:page_facing_up:](https://rclone.org/smb/)
-- Spectra Logic [:page_facing_up:](https://rclone.org/s3/#spectralogic)
-- Storj [:page_facing_up:](https://rclone.org/storj/)
-- SugarSync [:page_facing_up:](https://rclone.org/sugarsync/)
-- Synology C2 Object Storage [:page_facing_up:](https://rclone.org/s3/#synology-c2)
-- Tencent Cloud Object Storage (COS) [:page_facing_up:](https://rclone.org/s3/#tencent-cos)
-- Uloz.to [:page_facing_up:](https://rclone.org/ulozto/)
-- US3 Object Storage [:page_facing_up:](https://rclone.org/s3/#us3)
-- Wasabi [:page_facing_up:](https://rclone.org/s3/#wasabi)
-- WebDAV [:page_facing_up:](https://rclone.org/webdav/)
-- Yandex Disk [:page_facing_up:](https://rclone.org/yandex/)
-- Zadara Object Storage [:page_facing_up:](https://rclone.org/s3/#zadara)
-- Zero Services (ZERO-Z3) [:page_facing_up:](https://rclone.org/s3/#zero-z3)
-- Zoho WorkDrive [:page_facing_up:](https://rclone.org/zoho/)
-- Zata.ai [:page_facing_up:](https://rclone.org/s3/#Zata)
-- The local filesystem [:page_facing_up:](https://rclone.org/local/)
-
-Please see [the full list of all storage providers and their features](https://rclone.org/overview/)
-
-### Virtual storage providers
-
-These backends adapt or modify other storage providers
-
-- Alias: rename existing remotes [:page_facing_up:](https://rclone.org/alias/)
-- Archive: read archive files [:page_facing_up:](https://rclone.org/archive/)
-- Cache: cache remotes (DEPRECATED) [:page_facing_up:](https://rclone.org/cache/)
-- Chunker: split large files [:page_facing_up:](https://rclone.org/chunker/)
-- Combine: combine multiple remotes into a directory tree [:page_facing_up:](https://rclone.org/combine/)
-- Compress: compress files [:page_facing_up:](https://rclone.org/compress/)
-- Crypt: encrypt files [:page_facing_up:](https://rclone.org/crypt/)
-- Hasher: hash files [:page_facing_up:](https://rclone.org/hasher/)
-- Union: join multiple remotes to work together [:page_facing_up:](https://rclone.org/union/)
+> **Status:** Working / development build
+> **Architecture tested:** Linux ARM64 (Raspberry Pi)
+> **Go version tested:** Go 1.25
+> **rclone base:** v1.76.0-DEV
 
 ## Features
 
-- MD5/SHA-1 hashes checked at all times for file integrity
-- Timestamps preserved on files
-- Partial syncs supported on a whole file basis
-- [Copy](https://rclone.org/commands/rclone_copy/) mode to just copy new/changed
-  files
-- [Sync](https://rclone.org/commands/rclone_sync/) (one way) mode to make a directory
-  identical
-- [Bisync](https://rclone.org/bisync/) (two way) to keep two directories in sync
-  bidirectionally
-- [Check](https://rclone.org/commands/rclone_check/) mode to check for file hash
-  equality
-- Can sync to and from network, e.g. two different cloud accounts
-- Optional large file chunking ([Chunker](https://rclone.org/chunker/))
-- Optional transparent compression ([Compress](https://rclone.org/compress/))
-- Optional encryption ([Crypt](https://rclone.org/crypt/))
-- Optional FUSE mount ([rclone mount](https://rclone.org/commands/rclone_mount/))
-- Multi-threaded downloads to local disk
-- Can [serve](https://rclone.org/commands/rclone_serve/) local or remote files
-  over HTTP/WebDAV/FTP/SFTP/DLNA
+* TelDrive v2 backend
+* TelDrive API-key authentication
+* Telegram-backed file storage through TelDrive
+* Directory listing
+* File uploads/downloads
+* rclone commands such as `ls`, `lsd`, `copy`, `sync`, etc.
+* Configurable upload chunk size
+* Configurable upload concurrency
+* Optional TelDrive file encryption
+* Optional BLAKE3 tree hashing
+* Public link support
+* Threaded upload streams
 
-## Installation & documentation
+## Requirements
 
-Please see the [rclone website](https://rclone.org/) for:
+* Go 1.25 or newer
+* Linux/macOS/Windows supported by Go, depending on the target platform
+* A running TelDrive v2 server
+* A TelDrive API key
+* A TelDrive storage channel configured on the server
 
-- [Installation](https://rclone.org/install/)
-- [Documentation & configuration](https://rclone.org/docs/)
-- [Changelog](https://rclone.org/changelog/)
-- [FAQ](https://rclone.org/faq/)
-- [Storage providers](https://rclone.org/overview/)
-- [Forum](https://forum.rclone.org/)
-- ...and more
+For Raspberry Pi, a 64-bit OS is recommended.
 
-## Downloads
+## Build
 
-- <https://rclone.org/downloads/>
+Clone the repository:
+
+```bash
+git clone https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
+cd YOUR_REPOSITORY
+```
+
+Build rclone:
+
+```bash
+go build -o rclone .
+```
+
+Check the resulting binary:
+
+```bash
+./rclone version
+```
+
+You should see something similar to:
+
+```text
+rclone v1.76.0-DEV
+- os/type: linux
+- os/arch: arm64
+- go/version: go1.25.x
+```
+
+### Install system-wide
+
+On Linux:
+
+```bash
+sudo install -m 0755 rclone /usr/local/bin/rclone-teldrive
+```
+
+Then:
+
+```bash
+rclone-teldrive version
+```
+
+Using the name `rclone-teldrive` keeps this build separate from a normal system installation of official rclone.
+
+## TelDrive configuration
+
+Create a TelDrive remote using:
+
+```bash
+rclone-teldrive config
+```
+
+Choose:
+
+```text
+n) New remote
+```
+
+Set the backend to:
+
+```text
+teldrive
+```
+
+The important settings are:
+
+```text
+api_key
+api_host
+channel_id
+```
+
+Example configuration:
+
+```ini
+[teldrive]
+type = teldrive
+api_key = YOUR_TELDRIVE_API_KEY
+api_host = https://your-teldrive-server.example.com
+channel_id = YOUR_CHANNEL_ID
+```
+
+**Never commit your API key to Git.**
+
+The rclone configuration is normally stored at:
+
+```text
+~/.config/rclone/rclone.conf
+```
+
+## Test the connection
+
+List directories:
+
+```bash
+rclone-teldrive lsd teldrive:
+```
+
+List files:
+
+```bash
+rclone-teldrive ls teldrive:
+```
+
+Get information about the backend:
+
+```bash
+rclone-teldrive help backend teldrive
+```
+
+## Example operations
+
+Copy a local file to TelDrive:
+
+```bash
+rclone-teldrive copy ./file.iso teldrive:
+```
+
+Copy a directory:
+
+```bash
+rclone-teldrive copy ./my-folder teldrive:my-folder
+```
+
+List a remote directory:
+
+```bash
+rclone-teldrive ls teldrive:my-folder
+```
+
+Sync a local directory:
+
+```bash
+rclone-teldrive sync ./my-folder teldrive:my-folder
+```
+
+> Be careful with `sync`: files at the destination can be deleted to make the destination match the source.
+
+## Performance settings
+
+The TelDrive backend supports configurable upload parameters.
+
+### Chunk size
+
+Default:
+
+```text
+512 MiB
+```
+
+Example:
+
+```bash
+rclone-teldrive copy ./large-file teldrive: \
+  --teldrive-chunk-size 512M
+```
+
+Supported range:
+
+```text
+64 MiB – 2000 MiB
+```
+
+### Upload concurrency
+
+Default:
+
+```text
+4
+```
+
+Example:
+
+```bash
+rclone-teldrive copy ./large-file teldrive: \
+  --teldrive-upload-concurrency 4
+```
+
+Higher values can increase upload speed but also increase memory usage and may increase API/Telegram rate limiting.
+
+## Optional encryption
+
+TelDrive native encryption can be enabled with:
+
+```text
+--teldrive-encrypt-files
+```
+
+For example:
+
+```bash
+rclone-teldrive copy ./file.bin teldrive: \
+  --teldrive-encrypt-files
+```
+
+Encryption behavior depends on the TelDrive server configuration.
+
+## BLAKE3 integrity checking
+
+BLAKE3 tree hashing is enabled by default.
+
+It can be disabled with:
+
+```text
+--teldrive-hash-enabled=false
+```
+
+The backend uses 16 MiB blocks for the tree hash.
+
+## Raspberry Pi
+
+This project has been tested on:
+
+```text
+Raspberry Pi
+64-bit Raspberry Pi OS
+Linux ARM64 / AArch64
+Go 1.25
+```
+
+Example:
+
+```bash
+go build -o rclone .
+sudo install -m 0755 rclone /usr/local/bin/rclone-teldrive
+```
+
+Then:
+
+```bash
+/usr/local/bin/rclone-teldrive version
+```
+
+## Troubleshooting
+
+### `authentication is required`
+
+Verify that the API key is correct.
+
+The TelDrive API uses the:
+
+```text
+X-Api-Key
+```
+
+HTTP header.
+
+You can test authentication directly:
+
+```bash
+curl -i \
+  -H "X-Api-Key: YOUR_TELDRIVE_API_KEY" \
+  https://your-teldrive-server.example.com/api/v1/me
+```
+
+A successful response should return information about the authenticated TelDrive user.
+
+### `didn't find section in config file`
+
+Make sure the remote name matches your configuration.
+
+For example, if your configuration contains:
+
+```ini
+[teldrive]
+type = teldrive
+```
+
+use:
+
+```bash
+rclone-teldrive ls teldrive:
+```
+
+If your remote is named:
+
+```ini
+[teldrive-v2]
+type = teldrive
+```
+
+use:
+
+```bash
+rclone-teldrive ls teldrive-v2:
+```
+
+### `no overview data found for "teldrive"`
+
+The repository includes:
+
+```text
+docs/data/backends/teldrive.yaml
+```
+
+This file provides the backend overview metadata required by this rclone build.
+
+If you are working from an older checkout, make sure this file is present before rebuilding.
+
+## Development
+
+Run the TelDrive backend tests:
+
+```bash
+go test ./backend/teldrive
+```
+
+Run the complete test suite:
+
+```bash
+go test ./...
+```
+
+Build:
+
+```bash
+go build -o rclone .
+```
+
+## Disclaimer
+
+This is a custom/development build of rclone with TelDrive v2 support.
+
+It is **not an official rclone release** unless explicitly stated otherwise.
+
+Use production deployments at your own risk and test important data operations before relying on them for backups or synchronization.
 
 ## License
 
-This is free software under the terms of the MIT license (check the
-[COPYING file](/COPYING) included in this package).
+This project is based on rclone.
+
+See the repository's existing license files and upstream rclone licensing information for applicable terms.
+
+## Credits
+
+* [rclone](https://rclone.org/) — command-line cloud storage tool
+* TelDrive — Telegram-backed storage server
+
+If you find a problem with the TelDrive backend, please open an issue with:
+
+* rclone version
+* operating system
+* architecture
+* Go version
+* command being executed
+* relevant `-vv` output
+
+**Never include API keys, passwords, tokens, or other credentials in an issue.**
