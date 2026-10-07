@@ -187,7 +187,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload Image Digest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v6
         with:
           name: digests-${{ env.PLATFORM }}
           path: /tmp/digests/*
